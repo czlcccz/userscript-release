@@ -2,7 +2,7 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.9
+// @version      0.4.10
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
@@ -26,7 +26,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.9';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.10';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -532,6 +532,7 @@ const MWIGuildAssistantCore = (() => {
       },
       hasClientData: false,
       hasCharacterData: false,
+      captureStats: { count: 0, lastType: '' },
       updatedAt: null,
     };
   }
@@ -1836,20 +1837,25 @@ const MWIGuildAssistantCore = (() => {
         const value = hook.originalGetter.call(this);
         const currentHook = pageWindow[MESSAGE_EVENT_HOOK_KEY];
         if (currentHook.seenEvents.has(this)) return value;
-        currentHook.seenEvents.add(this);
-        if (typeof currentHook.listener !== 'function') return value;
-        // currentTarget is cleared after dispatch; target survives deferred reads;
-        // origin is set by the event itself and survives both - the most reliable
-        // way to attribute a message to the game socket when the game reads
-        // event.data asynchronously (common on mobile).
-        const socketUrl = String(this?.origin || this?.currentTarget?.url || this?.target?.url || '');
+        // currentTarget is the WebSocket during dispatch; target survives deferred
+        // reads; origin is set by the event itself and survives both. Prefer the
+        // proven socket-URL attribution (currentTarget/target, as mwitools uses)
+        // over origin so a quirky origin can never shadow a good socket match.
+        const socketUrl = String(this?.currentTarget?.url || this?.target?.url || this?.origin || '');
         if (GAME_SOCKET_URL_PATTERN.test(socketUrl)) {
-          currentHook.listener(value);
+          currentHook.seenEvents.add(this);
+          // Lock data as an own property (mwitools pattern): later reads, including
+          // deferred ones, hit the locked value instead of re-entering the getter,
+          // so capture survives however the game reads event.data afterwards.
+          try { Object.defineProperty(this, 'data', { value }); } catch (_error) { /* best-effort */ }
+          if (typeof currentHook.listener === 'function') currentHook.listener(value);
         } else if (!socketUrl && isGameShapedSocketData(value)) {
-          // Undetermined origin/url (deferred read where nothing survives):
-          // forward payloads that parse to a known game message rather than
-          // silently dropping the character's initial state.
-          currentHook.listener(value);
+          // Undetermined socket (deferred read where nothing survives): forward
+          // payloads that parse to a known game message rather than silently
+          // dropping the character's initial state.
+          currentHook.seenEvents.add(this);
+          try { Object.defineProperty(this, 'data', { value }); } catch (_error) { /* best-effort */ }
+          if (typeof currentHook.listener === 'function') currentHook.listener(value);
         } else if (!socketUrl && typeof value === 'string' && /^[{[]/.test(String(value).trim())) {
           debugLog('socket frame dropped (socket url undetermined)', value.length);
         }
@@ -1910,6 +1916,8 @@ const MWIGuildAssistantCore = (() => {
       const message = JSON.parse(text);
       if (!isRelevantMessage(message)) return false;
       debugLog('socket message', message?.type);
+      state.captureStats.count += 1;
+      state.captureStats.lastType = String(message?.type || '');
       if (message.type === 'profile_shared') {
         // A guildmate's profile pushed by the game when viewing their shareable
         // profile. It is not the local character's state, so it never enters
@@ -2090,6 +2098,8 @@ const MWIGuildAssistantCore = (() => {
       loadoutCount: Object.keys(state?.loadoutMap || {}).length,
       equipmentCount: filtered.length,
       updatedAt: state?.updatedAt || null,
+      captureCount: state?.captureStats?.count || 0,
+      lastCaptureType: state?.captureStats?.lastType || '',
     };
   }
 
@@ -2108,6 +2118,23 @@ const MWIGuildAssistantCore = (() => {
       return tag;
     });
     counts.replaceChildren(...tags);
+  }
+
+  // formatCaptureStatus turns capture stats into a one-line diagnostic shown in
+  // the sync section while the assistant is still waiting for init_character_data.
+  // It is empty (hidden) once character data is ready. Pure so it is unit-tested.
+  function formatCaptureStatus(summary) {
+    if (summary?.characterReady) return '';
+    if (!summary?.captureCount) return '消息监听：尚未捕获到游戏消息';
+    return `消息监听：已捕获 ${summary.captureCount} 条 · 最近 ${summary.lastCaptureType || '未知'}（等待角色数据）`;
+  }
+
+  function renderCaptureStatus(doc, captureStatus, summary) {
+    const text = formatCaptureStatus(summary);
+    if (captureStatus.getAttribute?.('data-status') === text) return;
+    captureStatus.setAttribute('data-status', text);
+    captureStatus.textContent = text;
+    captureStatus.hidden = !text;
   }
 
   function formatLocalDateTime(value) {
@@ -2554,6 +2581,10 @@ const MWIGuildAssistantCore = (() => {
     const lastSyncField = doc.createElement('div');
     lastSyncField.className = 'mwi-ga-last-sync-field';
     lastSyncField.append(lastSync);
+    const captureStatus = doc.createElement('div');
+    captureStatus.className = 'mwi-ga-message mwi-ga-capture-status';
+    captureStatus.setAttribute('role', 'status');
+    captureStatus.setAttribute('aria-live', 'polite');
     const syncStatus = doc.createElement('div');
     syncStatus.className = 'mwi-ga-message';
     syncStatus.setAttribute('role', 'status');
@@ -2586,7 +2617,7 @@ const MWIGuildAssistantCore = (() => {
     autoSyncControl.append(autoSyncSegment, reportButton);
     const autoSyncRow = createRow('同步方式', autoSyncControl);
     autoSyncRow.className += ' mwi-ga-sync-row';
-    syncSection.append(syncHeading, autoSyncRow, countsRow, lastSyncRow, syncStatus);
+    syncSection.append(syncHeading, autoSyncRow, countsRow, lastSyncRow, captureStatus, syncStatus);
 
     const cacheSection = doc.createElement('div');
     cacheSection.className = 'mwi-ga-section mwi-ga-cache-section';
@@ -3055,7 +3086,9 @@ const MWIGuildAssistantCore = (() => {
     myTrialRefreshButton.addEventListener('click', () => { refreshMyTrialSchedule(); });
 
     function refresh() {
-      renderAssistantCounts(doc, counts, summarizeState(state), getPublicSyncPlayer());
+      const summary = summarizeState(state);
+      renderAssistantCounts(doc, counts, summary, getPublicSyncPlayer());
+      renderCaptureStatus(doc, captureStatus, summary);
       if (isConnected && !myTrialCharacterLoaded && state?.hasCharacterData) {
         myTrialCharacterLoaded = true;
         refreshMyTrialSchedule();
@@ -3106,6 +3139,7 @@ const MWIGuildAssistantCore = (() => {
       connectionIdentity,
       syncStatus,
       status: syncStatus,
+      captureStatus,
       lastSync,
       autoSyncToggle,
       trialActions,
@@ -3987,6 +4021,7 @@ const MWIGuildAssistantCore = (() => {
     processSocketData,
     summarizeState,
     formatAssistantCounts,
+    formatCaptureStatus,
     formatLocalDateTime,
     formatByteSize,
     copyText,
