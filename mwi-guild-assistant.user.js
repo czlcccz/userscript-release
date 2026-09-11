@@ -2,7 +2,7 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.10
+// @version      0.4.11
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
@@ -26,7 +26,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.10';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.11';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -532,7 +532,6 @@ const MWIGuildAssistantCore = (() => {
       },
       hasClientData: false,
       hasCharacterData: false,
-      captureStats: { count: 0, lastType: '' },
       updatedAt: null,
     };
   }
@@ -1916,8 +1915,6 @@ const MWIGuildAssistantCore = (() => {
       const message = JSON.parse(text);
       if (!isRelevantMessage(message)) return false;
       debugLog('socket message', message?.type);
-      state.captureStats.count += 1;
-      state.captureStats.lastType = String(message?.type || '');
       if (message.type === 'profile_shared') {
         // A guildmate's profile pushed by the game when viewing their shareable
         // profile. It is not the local character's state, so it never enters
@@ -2098,8 +2095,6 @@ const MWIGuildAssistantCore = (() => {
       loadoutCount: Object.keys(state?.loadoutMap || {}).length,
       equipmentCount: filtered.length,
       updatedAt: state?.updatedAt || null,
-      captureCount: state?.captureStats?.count || 0,
-      lastCaptureType: state?.captureStats?.lastType || '',
     };
   }
 
@@ -2118,23 +2113,6 @@ const MWIGuildAssistantCore = (() => {
       return tag;
     });
     counts.replaceChildren(...tags);
-  }
-
-  // formatCaptureStatus turns capture stats into a one-line diagnostic shown in
-  // the sync section while the assistant is still waiting for init_character_data.
-  // It is empty (hidden) once character data is ready. Pure so it is unit-tested.
-  function formatCaptureStatus(summary) {
-    if (summary?.characterReady) return '';
-    if (!summary?.captureCount) return '消息监听：尚未捕获到游戏消息';
-    return `消息监听：已捕获 ${summary.captureCount} 条 · 最近 ${summary.lastCaptureType || '未知'}（等待角色数据）`;
-  }
-
-  function renderCaptureStatus(doc, captureStatus, summary) {
-    const text = formatCaptureStatus(summary);
-    if (captureStatus.getAttribute?.('data-status') === text) return;
-    captureStatus.setAttribute('data-status', text);
-    captureStatus.textContent = text;
-    captureStatus.hidden = !text;
   }
 
   function formatLocalDateTime(value) {
@@ -2581,10 +2559,6 @@ const MWIGuildAssistantCore = (() => {
     const lastSyncField = doc.createElement('div');
     lastSyncField.className = 'mwi-ga-last-sync-field';
     lastSyncField.append(lastSync);
-    const captureStatus = doc.createElement('div');
-    captureStatus.className = 'mwi-ga-message mwi-ga-capture-status';
-    captureStatus.setAttribute('role', 'status');
-    captureStatus.setAttribute('aria-live', 'polite');
     const syncStatus = doc.createElement('div');
     syncStatus.className = 'mwi-ga-message';
     syncStatus.setAttribute('role', 'status');
@@ -2617,7 +2591,7 @@ const MWIGuildAssistantCore = (() => {
     autoSyncControl.append(autoSyncSegment, reportButton);
     const autoSyncRow = createRow('同步方式', autoSyncControl);
     autoSyncRow.className += ' mwi-ga-sync-row';
-    syncSection.append(syncHeading, autoSyncRow, countsRow, lastSyncRow, captureStatus, syncStatus);
+    syncSection.append(syncHeading, autoSyncRow, countsRow, lastSyncRow, syncStatus);
 
     const cacheSection = doc.createElement('div');
     cacheSection.className = 'mwi-ga-section mwi-ga-cache-section';
@@ -3086,9 +3060,7 @@ const MWIGuildAssistantCore = (() => {
     myTrialRefreshButton.addEventListener('click', () => { refreshMyTrialSchedule(); });
 
     function refresh() {
-      const summary = summarizeState(state);
-      renderAssistantCounts(doc, counts, summary, getPublicSyncPlayer());
-      renderCaptureStatus(doc, captureStatus, summary);
+      renderAssistantCounts(doc, counts, summarizeState(state), getPublicSyncPlayer());
       if (isConnected && !myTrialCharacterLoaded && state?.hasCharacterData) {
         myTrialCharacterLoaded = true;
         refreshMyTrialSchedule();
@@ -3139,7 +3111,6 @@ const MWIGuildAssistantCore = (() => {
       connectionIdentity,
       syncStatus,
       status: syncStatus,
-      captureStatus,
       lastSync,
       autoSyncToggle,
       trialActions,
@@ -4021,7 +3992,6 @@ const MWIGuildAssistantCore = (() => {
     processSocketData,
     summarizeState,
     formatAssistantCounts,
-    formatCaptureStatus,
     formatLocalDateTime,
     formatByteSize,
     copyText,
