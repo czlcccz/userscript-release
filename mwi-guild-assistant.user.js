@@ -2,7 +2,7 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.12
+// @version      0.4.13
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
@@ -26,7 +26,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.12';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.13';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -1409,11 +1409,11 @@ const MWIGuildAssistantCore = (() => {
   // Binary (gzip) uploads are only sent on userscript managers known to carry
   // binary payloads correctly (Tampermonkey/Violentmonkey/...). iOS Safari
   // managers (Addons, Userscripts, Stay, ...) ignore or corrupt binary mode, so
-  // they fall back to plain JSON - the server accepts both. Without GM_info
-  // (unit tests / non-GM runtimes) keep the compressed path.
+  // they fall back to plain JSON - the server accepts both. Missing or unknown
+  // manager metadata also uses JSON; binary support must be explicitly known.
   const BINARY_CAPABLE_HANDLERS = new Set(['Tampermonkey', 'Violentmonkey', 'Greasemonkey', 'FireMonkey', 'ScriptCat']);
   function usesBinaryUpload() {
-    if (typeof GM_info === 'undefined' || !GM_info) return true;
+    if (typeof GM_info === 'undefined' || !GM_info) return false;
     return BINARY_CAPABLE_HANDLERS.has(String(GM_info.scriptHandler || ''));
   }
 
@@ -1458,7 +1458,7 @@ const MWIGuildAssistantCore = (() => {
         ...prepared.headers,
       },
       data: prepared.data,
-      binary: prepared.binary,
+      ...(prepared.binary === true ? { binary: true } : {}),
       timeout: 15000,
     });
   }
@@ -1505,7 +1505,7 @@ const MWIGuildAssistantCore = (() => {
         ...prepared.headers,
       },
       data: prepared.data,
-      binary: prepared.binary,
+      ...(prepared.binary === true ? { binary: true } : {}),
       timeout: 15000,
     });
   }
@@ -1529,7 +1529,7 @@ const MWIGuildAssistantCore = (() => {
         ...prepared.headers,
       },
       data: prepared.data,
-      binary: prepared.binary,
+      ...(prepared.binary === true ? { binary: true } : {}),
       timeout: 15000,
     });
   }
@@ -1553,7 +1553,7 @@ const MWIGuildAssistantCore = (() => {
         ...prepared.headers,
       },
       data: prepared.data,
-      binary: prepared.binary,
+      ...(prepared.binary === true ? { binary: true } : {}),
       timeout: 15000,
     });
   }
@@ -1577,7 +1577,7 @@ const MWIGuildAssistantCore = (() => {
         ...prepared.headers,
       },
       data: prepared.data,
-      binary: prepared.binary,
+      ...(prepared.binary === true ? { binary: true } : {}),
       timeout: 15000,
     });
   }
