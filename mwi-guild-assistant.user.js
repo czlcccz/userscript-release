@@ -2,7 +2,7 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.13
+// @version      0.4.14
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
@@ -26,7 +26,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.13';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.14';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -1379,15 +1379,33 @@ const MWIGuildAssistantCore = (() => {
         handle = request({
           ...details,
           onload(response) {
+            const status = Number(response.status);
+            const httpStatus = Number.isInteger(status) ? status : '未知';
             let body = null;
+            let raw;
             try {
-              body = response.responseText ? JSON.parse(response.responseText) : null;
+              // Hosts may expose text in response, or an already decoded JSON response.
+              raw = response.responseType === 'json'
+                ? response.response
+                : (response.responseText || response.response);
+              if (typeof raw === 'string') {
+                const text = raw.replace(/^\uFEFF/, '').trim();
+                body = text ? JSON.parse(text) : null;
+              } else if (response.responseType === 'json' && raw !== undefined) {
+                body = raw;
+              } else if (raw != null) {
+                throw new Error('Unsupported response type');
+              }
             } catch (_error) {
-              finish(new Error('服务端返回了无效 JSON'));
+              // Report only classification and HTTP status, never response bodies or credentials.
+              const format = typeof raw === 'string' && /^\s*</.test(raw.replace(/^\uFEFF/, ''))
+                ? 'HTML 页面，非 JSON'
+                : '无效 JSON';
+              finish(new Error(`服务端返回了${format}（HTTP ${httpStatus}）`));
               return;
             }
-            if (response.status < 200 || response.status >= 300) {
-              finish(new Error(body?.error?.message || `请求失败 (${response.status})`));
+            if (!Number.isInteger(status) || status < 200 || status >= 300) {
+              finish(new Error(body?.error?.message || `请求失败（HTTP ${httpStatus}）`));
               return;
             }
             finish(null, body);
