@@ -2,7 +2,7 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.8
+// @version      0.4.9
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
@@ -26,7 +26,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.8';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.9';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -1761,11 +1761,12 @@ const MWIGuildAssistantCore = (() => {
     };
   }
 
-  function installWebSocketHook(pageWindow, onRawMessage) {
+  function installWebSocketHook(pageWindow, onRawMessage, seenEvents) {
     if (!pageWindow?.WebSocket) throw new Error('当前页面不支持 WebSocket');
     const existingHook = pageWindow[WEB_SOCKET_HOOK_KEY];
     if (existingHook?.nativeWebSocket) {
       existingHook.listener = onRawMessage;
+      if (seenEvents) existingHook.seenEvents = seenEvents;
       return pageWindow.WebSocket;
     }
 
@@ -1773,6 +1774,7 @@ const MWIGuildAssistantCore = (() => {
     const hook = {
       nativeWebSocket: NativeWebSocket,
       listener: onRawMessage,
+      seenEvents: seenEvents || new WeakSet(),
     };
 
     function ObservedWebSocket(url, protocols) {
@@ -1782,7 +1784,14 @@ const MWIGuildAssistantCore = (() => {
       if (GAME_SOCKET_URL_PATTERN.test(String(url))) {
         socket.addEventListener('message', (event) => {
           const currentHook = pageWindow[WEB_SOCKET_HOOK_KEY];
-          if (typeof currentHook?.listener === 'function') {
+          // Reading event.data below also triggers the MessageEvent getter hook
+          // (when installed); the shared seenEvents set guarantees each event is
+          // processed exactly once whichever path fires first.
+          if (
+            typeof currentHook?.listener === 'function'
+            && !currentHook.seenEvents.has(event)
+          ) {
+            currentHook.seenEvents.add(event);
             currentHook.listener(event.data);
           }
         });
@@ -1802,10 +1811,11 @@ const MWIGuildAssistantCore = (() => {
     return ObservedWebSocket;
   }
 
-  function installMessageEventDataHook(pageWindow, onRawMessage) {
+  function installMessageEventDataHook(pageWindow, onRawMessage, seenEvents) {
     const existingHook = pageWindow?.[MESSAGE_EVENT_HOOK_KEY];
     if (existingHook?.originalGetter) {
       existingHook.listener = onRawMessage;
+      if (seenEvents) existingHook.seenEvents = seenEvents;
       return true;
     }
 
@@ -1816,7 +1826,7 @@ const MWIGuildAssistantCore = (() => {
     const hook = {
       originalGetter: descriptor.get,
       listener: onRawMessage,
-      seenEvents: new WeakSet(),
+      seenEvents: seenEvents || new WeakSet(),
     };
     pageWindow[MESSAGE_EVENT_HOOK_KEY] = hook;
 
@@ -1825,14 +1835,23 @@ const MWIGuildAssistantCore = (() => {
       get() {
         const value = hook.originalGetter.call(this);
         const currentHook = pageWindow[MESSAGE_EVENT_HOOK_KEY];
-        // currentTarget is cleared after dispatch; target survives deferred reads.
-        const socketUrl = String(this?.currentTarget?.url || this?.target?.url || '');
-        if (
-          GAME_SOCKET_URL_PATTERN.test(socketUrl)
-          && !currentHook.seenEvents.has(this)
-        ) {
-          currentHook.seenEvents.add(this);
-          if (typeof currentHook.listener === 'function') currentHook.listener(value);
+        if (currentHook.seenEvents.has(this)) return value;
+        currentHook.seenEvents.add(this);
+        if (typeof currentHook.listener !== 'function') return value;
+        // currentTarget is cleared after dispatch; target survives deferred reads;
+        // origin is set by the event itself and survives both - the most reliable
+        // way to attribute a message to the game socket when the game reads
+        // event.data asynchronously (common on mobile).
+        const socketUrl = String(this?.origin || this?.currentTarget?.url || this?.target?.url || '');
+        if (GAME_SOCKET_URL_PATTERN.test(socketUrl)) {
+          currentHook.listener(value);
+        } else if (!socketUrl && isGameShapedSocketData(value)) {
+          // Undetermined origin/url (deferred read where nothing survives):
+          // forward payloads that parse to a known game message rather than
+          // silently dropping the character's initial state.
+          currentHook.listener(value);
+        } else if (!socketUrl && typeof value === 'string' && /^[{[]/.test(String(value).trim())) {
+          debugLog('socket frame dropped (socket url undetermined)', value.length);
         }
         return value;
       },
@@ -1864,6 +1883,25 @@ const MWIGuildAssistantCore = (() => {
     );
   }
 
+  // debugLog is a browser-only console.debug gate: capture-path diagnostics stay
+  // out of node test output (no unsafeWindow there) and never touch payloads.
+  function debugLog(...args) {
+    if (typeof unsafeWindow === 'undefined') return;
+    try { console.debug('mwi-guild-assistant:', ...args); } catch (_error) { /* best-effort */ }
+  }
+
+  // isGameShapedSocketData reports whether a string payload parses to a message
+  // the assistant cares about. Used as a last-resort attribution when a deferred
+  // event read leaves no origin/currentTarget/target to identify the socket.
+  function isGameShapedSocketData(rawData) {
+    if (typeof rawData !== 'string') return false;
+    try {
+      return isRelevantMessage(JSON.parse(rawData));
+    } catch (_error) {
+      return false;
+    }
+  }
+
   async function processSocketData(state, rawData, handlers = {}) {
     let text;
     try {
@@ -1871,6 +1909,7 @@ const MWIGuildAssistantCore = (() => {
       if (!text) return false;
       const message = JSON.parse(text);
       if (!isRelevantMessage(message)) return false;
+      debugLog('socket message', message?.type);
       if (message.type === 'profile_shared') {
         // A guildmate's profile pushed by the game when viewing their shareable
         // profile. It is not the local character's state, so it never enters
@@ -1895,6 +1934,7 @@ const MWIGuildAssistantCore = (() => {
       reduceMessage(state, message);
       return true;
     } catch (_error) {
+      debugLog('socket frame could not be parsed', String(text || '').length);
       return false;
     }
   }
@@ -3869,8 +3909,17 @@ const MWIGuildAssistantCore = (() => {
     const handleRawMessage = async (rawData) => {
       if (await processSocketData(state, rawData, { onProfileShared, onGuildTrialStatsUpdated })) ui?.refresh();
     };
-    if (!installMessageEventDataHook(pageWindow, handleRawMessage)) {
-      installWebSocketHook(pageWindow, handleRawMessage);
+    // Install both capture paths and share one dedupe set: the WebSocket
+    // constructor wrap sees every message on sockets created after install (the
+    // reliable path), while the MessageEvent data getter nets sockets created
+    // before install or that bypass the wrap. The shared WeakSet guarantees each
+    // event is processed exactly once whichever path fires first.
+    const messageDedupe = new WeakSet();
+    installMessageEventDataHook(pageWindow, handleRawMessage, messageDedupe);
+    try {
+      installWebSocketHook(pageWindow, handleRawMessage, messageDedupe);
+    } catch (_error) {
+      // A page without WebSocket support cannot use the constructor wrap.
     }
 
     const startUi = () => {
