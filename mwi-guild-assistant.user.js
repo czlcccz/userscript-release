@@ -2,7 +2,7 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.14
+// @version      0.4.15
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
@@ -26,7 +26,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.14';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.15';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -1631,9 +1631,48 @@ const MWIGuildAssistantCore = (() => {
     });
   }
 
-  function createSettingsStore(getValue, setValue) {
+  function createSettingsStore(getValue, setValue, characterId = '', legacy = null) {
+    // Freeze the namespace so an in-flight operation can only write its own role.
+    const id = String(characterId || '').trim();
+    const read = getValue;
+    const write = setValue;
+    getValue = (key, fallback) => id ? read(`character:${encodeURIComponent(id)}:${key}`, fallback) : fallback;
+    setValue = (key, value) => {
+      if (!id) throw new Error('请先进入角色后再配置助手');
+      return write(`character:${encodeURIComponent(id)}:${key}`, value);
+    };
+    let migration = null;
+    let configWrites = Promise.resolve();
+    function enqueueConfigWrite(operation) {
+      const result = configWrites.then(operation);
+      // A failed migration must not prevent a subsequent manual save.
+      configWrites = result.catch(() => {});
+      return result;
+    }
+    async function migrateLegacyConfig() {
+      if (!id || !legacy || await getValue('uploadToken', null) !== null) return;
+      const token = String(await read('uploadToken', '') || '').trim();
+      const guildId = String(legacy.guildId || '').trim();
+      if (!token || !guildId) return;
+      const serverUrl = String(await read('serverUrl', DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
+      const context = await legacy.getContext({ serverUrl, token });
+      // Compare game IDs, never the console's internal guild UUID or its name.
+      const tokenGuildId = String(context?.guild?.gameGuildId ?? '').trim();
+      if (tokenGuildId && tokenGuildId !== guildId) return;
+      await enqueueConfigWrite(async () => {
+        if (!legacy.isCurrent() || await getValue('uploadToken', null) !== null) return;
+        await setValue('serverUrl', normalizeServerUrl(serverUrl));
+        await setValue('autoSyncEnabled', (await read('autoSyncEnabled', true)) !== false);
+        // Write the token last; an explicitly cleared token also prevents re-import.
+        await setValue('uploadToken', token);
+      });
+    }
     return {
+      loadSetupDismissed: () => getValue('setupReminderDismissed', false),
+      dismissSetupReminder: () => setValue('setupReminderDismissed', true),
       async load() {
+        if (!migration) migration = migrateLegacyConfig().finally(() => { migration = null; });
+        await migration;
         return {
           serverUrl: String(await getValue('serverUrl', DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL),
           token: String(await getValue('uploadToken', '') || ''),
@@ -1649,9 +1688,11 @@ const MWIGuildAssistantCore = (() => {
         };
         // An empty token is allowed so a cleared config can be saved (resets to
         // the unconfigured state); the server URL always falls back to the default.
-        await setValue('serverUrl', normalized.serverUrl);
-        await setValue('uploadToken', normalized.token);
-        return normalized;
+        return enqueueConfigWrite(async () => {
+          await setValue('serverUrl', normalized.serverUrl);
+          await setValue('uploadToken', normalized.token);
+          return normalized;
+        });
       },
       async saveLastSuccessfulSyncAt(isoTime) {
         await setValue('lastSuccessfulSyncAt', String(isoTime || ''));
@@ -1703,17 +1744,37 @@ const MWIGuildAssistantCore = (() => {
   }
 
   function createAssistantServices(state, dependencies) {
-    const settings = createSettingsStore(dependencies.getValue, dependencies.setValue);
-    return {
+    const characterId = String(state.character?.id || '');
+    const guildId = String(state.guild?.id || '');
+    const settings = createSettingsStore(dependencies.getValue, dependencies.setValue, characterId, {
+      guildId,
+      getContext: (config) => getUploadContext({ request: dependencies.request, ...config }),
+      isCurrent: () => String(state.character?.id || '') === characterId && String(state.guild?.id || '') === guildId,
+    });
+    const services = {
       loadConfig: settings.load,
-      loadSetupDismissed: () => dependencies.getValue('setupReminderDismissed', false),
-      dismissSetupReminder: () => dependencies.setValue('setupReminderDismissed', true),
+      loadSetupDismissed: settings.loadSetupDismissed,
+      dismissSetupReminder: settings.dismissSetupReminder,
       saveConfig: settings.save,
-      testConnection: (config) => getUploadContext({
-        request: dependencies.request,
-        serverUrl: config.serverUrl,
-        token: config.token,
-      }),
+      async testConnection(config) {
+        const context = await getUploadContext({
+          request: dependencies.request,
+          serverUrl: config.serverUrl,
+          token: config.token,
+        });
+        if (String(state.character?.id || '') !== characterId) {
+          throw new Error('角色已切换，请重新连接');
+        }
+        const currentGuildId = String(state.guild?.id || '').trim();
+        const tokenGuildId = String(context?.guild?.gameGuildId ?? '').trim();
+        if (!currentGuildId) {
+          throw new Error('当前角色不是该公会成员，无法连接');
+        }
+        if (tokenGuildId && currentGuildId !== tokenGuildId) {
+          throw new Error('当前角色不是该公会成员，无法连接');
+        }
+        return context;
+      },
       getGuildTrialSnapshot: () => buildGuildTrialSnapshot(state),
       buildGuildPublicInfoUploadPayload: () => buildGuildPublicInfoUploadPayload(
         state,
@@ -1789,6 +1850,19 @@ const MWIGuildAssistantCore = (() => {
         await Promise.all([settings.clearSyncCache(), settings.clearPublicInfoCache(), settings.clearGuildBuildingsCache()]);
       },
     };
+    // A detached panel must never combine its token with the next role's state.
+    return new Proxy(services, {
+      get(target, key) {
+        const method = target[key];
+        if (typeof method !== 'function') return method;
+        return (...args) => {
+          if (!characterId || String(state.character?.id || '') !== characterId || String(state.guild?.id || '') !== guildId) {
+            throw new Error('角色已切换，请等待助手加载当前角色配置');
+          }
+          return method(...args);
+        };
+      },
+    });
   }
 
   function installWebSocketHook(pageWindow, onRawMessage, seenEvents) {
@@ -2899,6 +2973,7 @@ const MWIGuildAssistantCore = (() => {
     const scheduleWindow = doc.defaultView;
     const AUTO_SYNC_BASE_MS = 10000;
     const AUTO_SYNC_JITTER_MS = 5000;
+    let disposed = false;
     let autoSyncEnabled = true;
     let autoSyncTimer = null;
     const nextAutoSyncDelay = () => AUTO_SYNC_BASE_MS + Math.floor(Math.random() * (AUTO_SYNC_JITTER_MS + 1));
@@ -2910,7 +2985,7 @@ const MWIGuildAssistantCore = (() => {
     }
     function scheduleAutoSync() {
       stopAutoSync();
-      if (!autoSyncEnabled || typeof scheduleWindow?.setTimeout !== 'function') return;
+      if (disposed || !autoSyncEnabled || typeof scheduleWindow?.setTimeout !== 'function') return;
       autoSyncTimer = scheduleWindow.setTimeout(runAutoSync, nextAutoSyncDelay());
     }
     async function runAutoSync() {
@@ -3019,7 +3094,7 @@ const MWIGuildAssistantCore = (() => {
     }
     function scheduleMyTrialRefresh() {
       stopMyTrialRefresh();
-      if (typeof scheduleWindow?.setInterval !== 'function') return;
+      if (disposed || typeof scheduleWindow?.setInterval !== 'function') return;
       myTrialTimer = scheduleWindow.setInterval(() => { refreshMyTrialSchedule(); }, MY_TRIAL_REFRESH_MS);
     }
     function renderCurrentMyTrial() {
@@ -3131,6 +3206,7 @@ const MWIGuildAssistantCore = (() => {
     refresh();
     return {
       panel,
+      dispose() { disposed = true; stopAutoSync(); stopMyTrialRefresh(); },
       counts,
       connectionStatus,
       openSettings() {
@@ -3480,6 +3556,7 @@ const MWIGuildAssistantCore = (() => {
   }
 
   function installAssistantUi(doc, state, onSync, options = {}) {
+    let disconnected = false;
     // isPublicSyncPlayer is a global state owned by bootstrap. installAssistantUi
     // pushes the connection probe's publicSync outcome into it (so it is set
     // before the guild panel mounts) and forwards the getters/setters to the
@@ -3499,6 +3576,7 @@ const MWIGuildAssistantCore = (() => {
     let connectionLabel = '';
     let pendingOpenSettings = false;
     function updateConnectionLabel(label) {
+      if (disconnected) return;
       connectionLabel = label;
       const tab = doc.getElementById(BUTTON_ID);
       const text = label ? '助手 · ' + label : '助手';
@@ -3538,6 +3616,7 @@ const MWIGuildAssistantCore = (() => {
     // The panel reuses the same probe via initialConnection and would otherwise
     // set this only after mounting.
     connectionProbe?.then((outcome) => {
+      if (disconnected) return;
       onPublicSyncChange(Boolean(outcome?.result?.publicSync?.enabled));
       scheduleStandaloneAutoSync();
     }).catch(() => { /* best-effort; leave isPublicSyncPlayer as-is */ });
@@ -3556,12 +3635,12 @@ const MWIGuildAssistantCore = (() => {
     let standaloneSyncTimer = null;
     let standaloneSyncing = false;
     const scheduleStandaloneAutoSync = () => {
-      if (panelUi || !canStandaloneSync || standaloneSyncTimer) return;
+      if (disconnected || panelUi || !canStandaloneSync || standaloneSyncTimer) return;
       standaloneSyncTimer = setTimeout(runStandaloneAutoSync, 10000 + Math.floor(Math.random() * 5001));
     };
     const runStandaloneAutoSync = async () => {
       standaloneSyncTimer = null;
-      if (panelUi) return;  // panel mounted; its auto-sync takes over
+      if (disconnected || panelUi) return;  // panel mounted; its auto-sync takes over
       let config;
       try { config = await onSync.loadConfig(); } catch (_e) { scheduleStandaloneAutoSync(); return; }
       if (config?.autoSyncEnabled === false) { scheduleStandaloneAutoSync(); return; }
@@ -3569,6 +3648,8 @@ const MWIGuildAssistantCore = (() => {
       if (standaloneSyncing) { scheduleStandaloneAutoSync(); return; }
       standaloneSyncing = true;
       try {
+        // The standalone path must enforce the same guild check as the panel.
+        await onSync.testConnection(config);
         // 玩家信息同步：连上就同步，对比缓存
         await onSync.sync(config, { useCache: true });
         // 公共信息上报：仅管理 token，对比缓存
@@ -3599,6 +3680,7 @@ const MWIGuildAssistantCore = (() => {
 
     let panelUi = null;
     let nativePanelsRoot = null;
+    let restoreNativePanel = () => {};
 
     function refresh() {
       const counts = doc.getElementById(COUNTS_ID);
@@ -3619,6 +3701,7 @@ const MWIGuildAssistantCore = (() => {
     }
 
     function ensureUi() {
+      if (disconnected) return;
       addStyles();
       const existingButton = doc.getElementById(BUTTON_ID);
       const existingPanel = doc.getElementById(PANEL_ID);
@@ -3659,6 +3742,13 @@ const MWIGuildAssistantCore = (() => {
       const panel = panelUi.panel;
       mountAssistantPanel(panel, panelsContainer);
       const visibility = createPanelVisibilityController(panel, panelsContainer);
+      let previousNativeTab = null;
+      restoreNativePanel = () => {
+        if (assistantTab.getAttribute('aria-selected') === 'true') {
+          setAssistantTabSelection(tabList, assistantTab, false, previousNativeTab);
+        }
+        visibility.hide();
+      };
 
       function hideAssistant(nativeTab = null) {
         setAssistantTabSelection(tabList, assistantTab, false, nativeTab);
@@ -3666,6 +3756,10 @@ const MWIGuildAssistantCore = (() => {
       }
 
       function showAssistant() {
+        if (assistantTab.getAttribute('aria-selected') !== 'true') {
+          previousNativeTab = [...tabList.querySelectorAll('[role="tab"]')]
+            .find((tab) => tab !== assistantTab && tab.getAttribute('aria-selected') === 'true') || null;
+        }
         setAssistantTabSelection(tabList, assistantTab, true);
         visibility.show();
         refresh();
@@ -3676,7 +3770,7 @@ const MWIGuildAssistantCore = (() => {
         if (event.key === 'Enter' || event.key === ' ') showAssistant();
       });
       tabList.addEventListener('click', (event) => {
-        if (assistantTab.contains(event.target)) return;
+        if (disconnected || assistantTab.contains(event.target)) return;
         const nativeTab = event.target?.closest?.('[role="tab"]') || null;
         hideAssistant(nativeTab);
       }, true);
@@ -3690,7 +3784,18 @@ const MWIGuildAssistantCore = (() => {
     if (doc.body) observer.observe(doc.body, { childList: true, subtree: true });
     return {
       refresh,
-      disconnect: () => { gameReady.cancel(); connectionToast.dismiss(); observer.disconnect(); if (standaloneSyncTimer) { clearTimeout(standaloneSyncTimer); standaloneSyncTimer = null; } },
+      disconnect() {
+        disconnected = true;
+        restoreNativePanel();
+        panelUi?.dispose?.();
+        doc.getElementById(BUTTON_ID)?.remove?.();
+        doc.getElementById(PANEL_ID)?.remove?.();
+        gameReady.cancel();
+        connectionToast.dismiss();
+        observer.disconnect();
+        if (standaloneSyncTimer) clearTimeout(standaloneSyncTimer);
+        standaloneSyncTimer = null;
+      },
       syncNativeTrials,
     };
   }
@@ -3864,6 +3969,8 @@ const MWIGuildAssistantCore = (() => {
   function bootstrap(pageWindow, doc, dependencies = null) {
     const state = createState();
     let ui = null;
+    let uiCharacterId = '';
+    let uiGuildId = '';
     // isPublicSyncPlayer is the single global source of truth for "is the
     // connected token a management token" (from /uploads/context.publicSync).
     // Set by installAssistantUi's connection probe (before the panel mounts)
@@ -3874,8 +3981,9 @@ const MWIGuildAssistantCore = (() => {
     // repeatedly opening the same shareable profile within 5s only uploads
     // once. In-memory only; resets on page reload, which is acceptable.
     const profileDedupe = new Map();
-    const profileSettings = dependencies ? createSettingsStore(dependencies.getValue, dependencies.setValue) : null;
+    const getProfileSettings = () => dependencies ? createSettingsStore(dependencies.getValue, dependencies.setValue, state.character?.id) : null;
     const onProfileShared = (message) => {
+      const profileSettings = getProfileSettings();
       const profile = message?.profile;
       const sharedName = profile?.sharableCharacter?.name;
       const sharedGuildId = profile?.guildId;
@@ -3921,6 +4029,7 @@ const MWIGuildAssistantCore = (() => {
     // server-side reject (e.g. trial roster not synced yet) the fingerprint is
     // not saved, so the next message retries.
     const onGuildTrialStatsUpdated = (message) => {
+      const profileSettings = getProfileSettings();
       if (!profileSettings || typeof dependencies?.request !== 'function') return;
       if (!isPublicSyncPlayer) return; // only management tokens may report guild stats
       const now = dependencies.now?.() || new Date();
@@ -3942,7 +4051,16 @@ const MWIGuildAssistantCore = (() => {
       })();
     };
     const handleRawMessage = async (rawData) => {
-      if (await processSocketData(state, rawData, { onProfileShared, onGuildTrialStatsUpdated })) ui?.refresh();
+      if (await processSocketData(state, rawData, { onProfileShared, onGuildTrialStatsUpdated })) {
+        if (uiCharacterId !== String(state.character?.id || '') || uiGuildId !== String(state.guild?.id || '')) {
+          ui?.disconnect();
+          ui = null;
+          isPublicSyncPlayer = false;
+          profileDedupe.clear();
+          startUi();
+        }
+        ui?.refresh();
+      }
     };
     // Install both capture paths and share one dedupe set: the WebSocket
     // constructor wrap sees every message on sockets created after install (the
@@ -3958,13 +4076,17 @@ const MWIGuildAssistantCore = (() => {
     }
 
     const startUi = () => {
-      if (ui) return;
+      if (ui || !state.character?.id || doc.readyState === 'loading') return;
+      uiCharacterId = String(state.character.id);
+      uiGuildId = String(state.guild?.id || '');
+      const roleId = uiCharacterId;
+      const roleGuildId = uiGuildId;
       const panelServices = dependencies
         ? createAssistantServices(state, dependencies)
         : () => buildSnapshot(state);
       ui = installAssistantUi(doc, state, panelServices, {
         getPublicSyncPlayer: () => isPublicSyncPlayer,
-        onPublicSyncChange: (value) => { isPublicSyncPlayer = Boolean(value); },
+        onPublicSyncChange: (value) => { if (String(state.character?.id || '') === roleId && String(state.guild?.id || '') === roleGuildId) isPublicSyncPlayer = Boolean(value); },
       });
     };
     if (doc.readyState === 'loading') {
