@@ -2,13 +2,12 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.15
+// @version      0.4.17
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
 // @match        https://www.milkywayidle.com/*
 // @match        https://www.milkywayidlecn.com/*
-// @require      https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako_deflate.min.js
 // @run-at       document-start
 // @grant        unsafeWindow
 // @grant        GM_getValue
@@ -26,7 +25,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.15';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.17';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -1435,16 +1434,22 @@ const MWIGuildAssistantCore = (() => {
     return BINARY_CAPABLE_HANDLERS.has(String(GM_info.scriptHandler || ''));
   }
 
-  // Use pako instead of native streams so compression cannot wait on stream
-  // backpressure. Binary strings avoid passing ArrayBuffer through the host's
-  // extension bridge; GM binary mode preserves bytes rather than UTF-8 encoding.
+  // Gzip via the native CompressionStream - no @require/CDN dependency, so it
+  // also works inside embedded game clients (e.g. Steam) whose script managers
+  // never load required scripts. pipeThrough + Response.arrayBuffer() drives the
+  // stream to completion from the reader side, so backpressure cannot deadlock
+  // a manual write-then-drain loop. Feature-detected: clients without the API
+  // (older Safari/embedded webviews) fall back to plain JSON, never blocking
+  // sync. Binary strings avoid passing ArrayBuffer through the host's extension
+  // bridge; GM binary mode preserves bytes rather than UTF-8 encoding.
   async function compressUploadBody(json) {
     if (!usesBinaryUpload()) return { data: json, headers: {} };
     try {
-      if (typeof pako === 'undefined' || typeof pako.gzip !== 'function') {
+      if (typeof CompressionStream !== 'function' || typeof Blob !== 'function' || typeof Response !== 'function') {
         return { data: json, headers: {} };
       }
-      const compressed = pako.gzip(json);
+      const stream = new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'));
+      const compressed = new Uint8Array(await new Response(stream).arrayBuffer());
       const chunks = [];
       for (let offset = 0; offset < compressed.length; offset += 8192) {
         chunks.push(String.fromCharCode(...compressed.subarray(offset, offset + 8192)));
@@ -1455,7 +1460,7 @@ const MWIGuildAssistantCore = (() => {
         headers: { 'Content-Encoding': 'gzip' },
       };
     } catch (_error) {
-      // Compression is optional; a broken/missing dependency must not stop sync.
+      // Compression is optional; a broken/missing API must not stop sync.
       return { data: json, headers: {} };
     }
   }
@@ -3605,7 +3610,10 @@ const MWIGuildAssistantCore = (() => {
     const connectionProbe = startConnectionProbe(onSync);
     const gameReady = waitForGameReady(doc);
     if (!connectionProbe) gameReady.cancel();
-    wireConnectionToast(connectionProbe, connectionToast, onSync, gameReady.promise);
+    // Guildless characters cannot use the guild assistant, so skip the setup
+    // prompt until they join a guild (shouldOfferAssistantSetup only suppresses
+    // once character data confirms there is no guild).
+    wireConnectionToast(connectionProbe, connectionToast, onSync, gameReady.promise, () => shouldOfferAssistantSetup(state));
     connectionProbe?.then((outcome) => {
       if (outcome?.connected) gameReady.cancel();
       updateConnectionLabel(outcome?.connected ? '' : outcome?.configured || outcome?.error ? '连接异常' : '待配置');
@@ -3952,17 +3960,27 @@ const MWIGuildAssistantCore = (() => {
     })();
   }
 
+  // A character outside any guild cannot use the guild assistant, so the setup
+  // toast is skipped until they join one. Only suppresses when character data
+  // has arrived and reports no guild; an unknown state (data still loading)
+  // still offers setup, so guilded players are never left without the prompt.
+  function shouldOfferAssistantSetup(state) {
+    return !(state?.hasCharacterData && !state.guild);
+  }
+
   // wireConnectionToast shows the toast when the probe resolves to not-connected.
   // Extracted from installAssistantUi so the probe->toast link is testable
-  // without the full guild-panel DOM.
-  function wireConnectionToast(probe, toast, services = {}, gameReady = Promise.resolve(true)) {
+  // without the full guild-panel DOM. shouldShow is consulted right before
+  // mounting (after gameReady) so callers can skip the prompt for characters
+  // that cannot use the assistant (e.g. no guild).
+  function wireConnectionToast(probe, toast, services = {}, gameReady = Promise.resolve(true), shouldShow = () => true) {
     if (!probe || !toast || typeof toast.show !== 'function') return;
     return probe.then(async (outcome) => {
       if (outcome?.connected) return;
       if (!outcome?.configured && !outcome?.error) {
         try { if (await services?.loadSetupDismissed?.()) return; } catch (_error) { /* Still offer setup when storage is unavailable. */ }
       }
-      if (await gameReady) toast.show(outcome);
+      if ((await gameReady) && shouldShow()) toast.show(outcome);
     }).catch(() => { /* A failed startup probe must not interrupt the game. */ });
   }
 
@@ -4165,6 +4183,7 @@ const MWIGuildAssistantCore = (() => {
     createConnectionToast,
     startConnectionProbe,
     wireConnectionToast,
+    shouldOfferAssistantSetup,
     isGameReady,
     waitForGameReady,
     bootstrap,
