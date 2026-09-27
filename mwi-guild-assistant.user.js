@@ -14,6 +14,7 @@
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_info
+// @connect      mwi-guild-helper.cloud
 // @connect      *
 // @downloadURL  https://mwi-guild-helper.cloud/userscript/mwi-guild-assistant.user.js
 // @updateURL    https://mwi-guild-helper.cloud/userscript/mwi-guild-assistant.user.js
