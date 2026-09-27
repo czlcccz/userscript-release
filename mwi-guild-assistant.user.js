@@ -2,7 +2,7 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.17
+// @version      0.4.18
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
@@ -25,7 +25,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.17';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.18';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -3509,18 +3509,25 @@ const MWIGuildAssistantCore = (() => {
     const ASSIGNED = `${TILE}[data-mwi-ga-assigned="1"]`;
     return `
       .mwi-ga-native-assignment-row { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin: 4px 0 0; font-family: inherit; }
-      .mwi-ga-native-assignment-label { color: #b6bbd3; font-size: 12px; line-height: 1.5; }
-      .mwi-ga-native-assignment-tag { display: inline-flex; align-items: center; gap: 6px; min-height: 24px; max-width: 100%; box-sizing: border-box; padding: 2px 0; border: 0; border-radius: 2px; background: transparent; color: #bcc9ff; font-family: inherit; font-size: 12px; font-weight: 500; line-height: 1.5; text-align: left; overflow-wrap: anywhere; cursor: pointer; text-decoration: underline; text-decoration-color: #59658e; text-underline-offset: 4px; transition: color .15s ease, text-decoration-color .15s ease; }
+      .mwi-ga-native-assignment-label { color: #b6bbd3; font-size: 14px; line-height: 1.5; }
+      .mwi-ga-native-assignment-tag { display: inline-flex; align-items: center; gap: 6px; min-height: 24px; max-width: 100%; box-sizing: border-box; padding: 2px 0; border: 0; border-radius: 2px; background: transparent; color: #bcc9ff; font-family: inherit; font-size: 14px; font-weight: 500; line-height: 1.5; text-align: left; overflow-wrap: anywhere; cursor: pointer; text-decoration: underline; text-decoration-color: #59658e; text-underline-offset: 4px; transition: color .15s ease, text-decoration-color .15s ease; }
       .mwi-ga-native-assignment-tag::after { content: ""; flex: 0 0 4px; width: 4px; height: 4px; border-top: 1px solid currentColor; border-right: 1px solid currentColor; transform: rotate(45deg); margin-right: 2px; }
       .mwi-ga-native-assignment-tag:hover { color: #edf0ff; text-decoration-color: currentColor; }
       .mwi-ga-native-assignment-tag:active { color: #9dacdf; }
       .mwi-ga-native-assignment-tag:focus-visible { outline: 2px solid #b0bfff; outline-offset: 3px; }
-      ${ASSIGNED} { position: relative; isolation: isolate; }
-      ${ASSIGNED}::before { content: "分配"; position: absolute; top: -8px; right: 6px; z-index: 1; pointer-events: none; padding: 1px 5px; border: 1px solid #69769e; border-radius: 3px; background: #2e344d; color: #dce3ff; font-size: 10px; font-weight: 500; line-height: 1.4; white-space: nowrap; }
+      ${ASSIGNED} { position: relative; isolation: isolate; background-color: #3b3d62; }
+      ${ASSIGNED}::before { content: ""; position: absolute; top: 0; right: 10px; width: 10px; height: 15px; background: #b4bfff; clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 74%, 0 100%); pointer-events: none; }
+      .mwi-ga-native-assignment-label::before { content: ""; display: inline-block; width: 7px; height: 10px; margin-right: 6px; background: #b4bfff; clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 74%, 0 100%); vertical-align: -1px; }
       ${TILE}[data-mwi-ga-intro="1"]::after, ${TILE}[data-mwi-ga-flash="1"]::after { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none; border-radius: inherit; background: rgba(173,190,255,.16); animation: mwi-ga-assigned-reveal ${NATIVE_INTRO_MS}ms ease-out forwards; }
       ${TILE}[data-mwi-ga-flash="1"]::after { animation-duration: ${NATIVE_FLASH_MS}ms; }
       @keyframes mwi-ga-assigned-reveal { from { opacity: 1; } to { opacity: 0; } }
       @media (pointer: coarse) { .mwi-ga-native-assignment-tag { min-height: 32px; } }
+      @media (max-width: 560px) {
+        .mwi-ga-native-assignment-row { gap: 2px 8px; margin-top: 2px; }
+        .mwi-ga-native-assignment-label, .mwi-ga-native-assignment-tag { font-size: 10px; }
+        .mwi-ga-native-assignment-tag { gap: 4px; text-underline-offset: 3px; }
+        ${ASSIGNED}::before { right: 8px; width: 8px; height: 12px; }
+      }
       @media (prefers-reduced-motion: reduce) {
         .mwi-ga-native-assignment-tag { transition: none; }
         ${TILE}[data-mwi-ga-intro="1"]::after, ${TILE}[data-mwi-ga-flash="1"]::after { animation: none !important; }
