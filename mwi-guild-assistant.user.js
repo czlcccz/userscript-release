@@ -2,7 +2,7 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.18
+// @version      0.4.19
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
@@ -26,7 +26,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.18';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.19';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -1359,7 +1359,12 @@ const MWIGuildAssistantCore = (() => {
     return url.toString().replace(/\/$/, '');
   }
 
-  function requestJson(request, details) {
+  function requestJson(request, details, fetchRequest) {
+    const target = new URL(details.url);
+    if (target.origin === DEFAULT_SERVER_URL && target.pathname.startsWith('/api/v1/uploads/')
+      && typeof fetchRequest === 'function' && typeof AbortController === 'function') {
+      request = nativeApiRequest(fetchRequest);
+    }
     return new Promise((resolve, reject) => {
       let settled = false;
       let handle;
@@ -1466,7 +1471,7 @@ const MWIGuildAssistantCore = (() => {
     }
   }
 
-  async function uploadSnapshot({ request, serverUrl, token, snapshot }) {
+  async function uploadSnapshot({ request, fetch: fetchRequest, serverUrl, token, snapshot }) {
     if (typeof request !== 'function') throw new Error('当前油猴环境不支持跨域请求');
     const normalizedUrl = normalizeServerUrl(serverUrl);
     const normalizedToken = String(token || '').trim();
@@ -1484,7 +1489,7 @@ const MWIGuildAssistantCore = (() => {
       data: prepared.data,
       ...(prepared.binary === true ? { binary: true } : {}),
       timeout: 15000,
-    });
+    }, fetchRequest);
   }
 
   function buildGuildPublicInfoUploadRequestPayload(payload) {
@@ -1514,7 +1519,7 @@ const MWIGuildAssistantCore = (() => {
     };
   }
 
-  async function uploadGuildPublicInfo({ request, serverUrl, token, payload }) {
+  async function uploadGuildPublicInfo({ request, fetch: fetchRequest, serverUrl, token, payload }) {
     if (typeof request !== 'function') throw new Error('当前油猴环境不支持跨域请求');
     const normalizedUrl = normalizeServerUrl(serverUrl);
     const normalizedToken = String(token || '').trim();
@@ -1531,14 +1536,14 @@ const MWIGuildAssistantCore = (() => {
       data: prepared.data,
       ...(prepared.binary === true ? { binary: true } : {}),
       timeout: 15000,
-    });
+    }, fetchRequest);
   }
 
   // uploadPlayerImport pushes a guildmate's profile (converted from a
   // profile_shared message) to the server. Like uploadGuildPublicInfo it uses
   // a management token as a Bearer credential; the server rejects non-
   // management tokens, so only guild admins can import guildmate profiles.
-  async function uploadPlayerImport({ request, serverUrl, token, payload }) {
+  async function uploadPlayerImport({ request, fetch: fetchRequest, serverUrl, token, payload }) {
     if (typeof request !== 'function') throw new Error('当前油猴环境不支持跨域请求');
     const normalizedUrl = normalizeServerUrl(serverUrl);
     const normalizedToken = String(token || '').trim();
@@ -1555,14 +1560,14 @@ const MWIGuildAssistantCore = (() => {
       data: prepared.data,
       ...(prepared.binary === true ? { binary: true } : {}),
       timeout: 15000,
-    });
+    }, fetchRequest);
   }
 
   // uploadGuildTrialStats posts the game's per-member trial stats
   // (guild_trial_stats_updated) to the server. The server only accepts a
   // management token (like the public-info roster upload) - the caller (bootstrap
   // onGuildTrialStatsUpdated) gates on isPublicSyncPlayer before invoking this.
-  async function uploadGuildTrialStats({ request, serverUrl, token, payload }) {
+  async function uploadGuildTrialStats({ request, fetch: fetchRequest, serverUrl, token, payload }) {
     if (typeof request !== 'function') throw new Error('当前油猴环境不支持跨域请求');
     const normalizedUrl = normalizeServerUrl(serverUrl);
     const normalizedToken = String(token || '').trim();
@@ -1579,14 +1584,14 @@ const MWIGuildAssistantCore = (() => {
       data: prepared.data,
       ...(prepared.binary === true ? { binary: true } : {}),
       timeout: 15000,
-    });
+    }, fetchRequest);
   }
 
   // uploadGuildBuildingLevels posts the guild building level map (captured from
   // init_character_data / guild_updated) to the server. The server only accepts
   // a management token (like the public-info roster upload) - the caller gates
   // on isPublicSyncPlayer before invoking this.
-  async function uploadGuildBuildingLevels({ request, serverUrl, token, payload }) {
+  async function uploadGuildBuildingLevels({ request, fetch: fetchRequest, serverUrl, token, payload }) {
     if (typeof request !== 'function') throw new Error('当前油猴环境不支持跨域请求');
     const normalizedUrl = normalizeServerUrl(serverUrl);
     const normalizedToken = String(token || '').trim();
@@ -1603,10 +1608,42 @@ const MWIGuildAssistantCore = (() => {
       data: prepared.data,
       ...(prepared.binary === true ? { binary: true } : {}),
       timeout: 15000,
-    });
+    }, fetchRequest);
   }
 
-  async function getUploadContext({ request, serverUrl, token }) {
+  // The default server's userscript routes support credential-free CORS.
+  // Use native networking for every endpoint so GM bridge stalls cannot leave
+  // connection working while schedule reads or uploads fail. Never replay a
+  // failed request through GM: the server may already have accepted an upload.
+  function nativeApiRequest(fetchRequest) {
+    return (details) => {
+      const controller = new AbortController();
+      let cancelled = false;
+      Promise.resolve().then(() => {
+        if (cancelled) return null;
+        return fetchRequest(details.url, {
+          method: details.method, headers: details.headers, credentials: 'omit',
+          signal: controller.signal,
+          // GM binary strings carry bytes; fetch would otherwise UTF-8 encode them.
+          body: details.binary === true
+            ? Uint8Array.from(details.data, character => character.charCodeAt(0))
+            : details.data,
+        });
+      }).then(async (response) => {
+        if (cancelled) return;
+        const responseText = await response.text();
+        if (!cancelled) details.onload({ status: response.status, responseText });
+      }).catch(() => { if (!cancelled) details.onerror(); });
+      return {
+        abort() {
+          cancelled = true;
+          controller.abort();
+        },
+      };
+    };
+  }
+
+  async function getUploadContext({ request, fetch: fetchRequest, serverUrl, token }) {
     if (typeof request !== 'function') throw new Error('当前油猴环境不支持跨域请求');
     const normalizedUrl = normalizeServerUrl(serverUrl);
     const normalizedToken = String(token || '').trim();
@@ -1616,13 +1653,13 @@ const MWIGuildAssistantCore = (() => {
       url: `${normalizedUrl}/api/v1/uploads/context`,
       headers: { Authorization: `Bearer ${normalizedToken}` },
       timeout: 10000,
-    });
+    }, fetchRequest);
   }
 
   // fetchMyTrialSchedule fetches the calling player's own expected trial
   // assignments (排刀) for the current cycle. characterId comes from the live
   // game state (state.character.id); the server filters to that character only.
-  async function fetchMyTrialSchedule({ request, serverUrl, token, characterId }) {
+  async function fetchMyTrialSchedule({ request, fetch: fetchRequest, serverUrl, token, characterId }) {
     if (typeof request !== 'function') throw new Error('当前油猴环境不支持跨域请求');
     const normalizedUrl = normalizeServerUrl(serverUrl);
     const normalizedToken = String(token || '').trim();
@@ -1634,7 +1671,7 @@ const MWIGuildAssistantCore = (() => {
       url: `${normalizedUrl}/api/v1/uploads/trials/my-schedule?characterId=${encodeURIComponent(normalizedCharacterId)}`,
       headers: { Authorization: `Bearer ${normalizedToken}` },
       timeout: 10000,
-    });
+    }, fetchRequest);
   }
 
   function createSettingsStore(getValue, setValue, characterId = '', legacy = null) {
@@ -1754,7 +1791,7 @@ const MWIGuildAssistantCore = (() => {
     const guildId = String(state.guild?.id || '');
     const settings = createSettingsStore(dependencies.getValue, dependencies.setValue, characterId, {
       guildId,
-      getContext: (config) => getUploadContext({ request: dependencies.request, ...config }),
+      getContext: (config) => getUploadContext({ request: dependencies.request, fetch: dependencies.fetch, ...config }),
       isCurrent: () => String(state.character?.id || '') === characterId && String(state.guild?.id || '') === guildId,
     });
     const services = {
@@ -1765,6 +1802,7 @@ const MWIGuildAssistantCore = (() => {
       async testConnection(config) {
         const context = await getUploadContext({
           request: dependencies.request,
+          fetch: dependencies.fetch,
           serverUrl: config.serverUrl,
           token: config.token,
         });
@@ -1788,6 +1826,7 @@ const MWIGuildAssistantCore = (() => {
       ),
       uploadGuildPublicInfo: (config, payload) => uploadGuildPublicInfo({
         request: dependencies.request,
+        fetch: dependencies.fetch,
         serverUrl: config.serverUrl,
         token: config.token,
         payload,
@@ -1798,12 +1837,14 @@ const MWIGuildAssistantCore = (() => {
       ),
       uploadGuildBuildingLevels: (config, payload) => uploadGuildBuildingLevels({
         request: dependencies.request,
+        fetch: dependencies.fetch,
         serverUrl: config.serverUrl,
         token: config.token,
         payload,
       }),
       fetchMyTrialSchedule: (config) => fetchMyTrialSchedule({
         request: dependencies.request,
+        fetch: dependencies.fetch,
         serverUrl: config.serverUrl,
         token: config.token,
         characterId: String(state?.character?.id || '').trim(),
@@ -1819,6 +1860,7 @@ const MWIGuildAssistantCore = (() => {
         }
         const result = await uploadSnapshot({
           request: dependencies.request,
+          fetch: dependencies.fetch,
           serverUrl: config.serverUrl,
           token: config.token,
           snapshot,
@@ -4039,7 +4081,7 @@ const MWIGuildAssistantCore = (() => {
           const token = String(config?.token || '').trim();
           if (!serverUrl || !token) { profileLog({ action: 'skip', reason: '未配置服务器或 token' }); return; }
           profileLog({ action: 'upload', method: 'POST', url: '/api/v1/uploads/player-import', server: serverUrl, characterId: target.characterId });
-          await uploadPlayerImport({ request: dependencies.request, serverUrl, token, payload });
+          await uploadPlayerImport({ request: dependencies.request, fetch: dependencies.fetch, serverUrl, token, payload });
           profileLog({ action: 'uploaded', characterId: target.characterId });
         } catch (error) {
           try { console.warn('mwi-guild-assistant: profile import failed', error); } catch (_e) { /* best-effort */ }
@@ -4069,7 +4111,7 @@ const MWIGuildAssistantCore = (() => {
           const token = String(config?.token || '').trim();
           if (!serverUrl || !token) return;
           if (await profileSettings.loadTrialStatsCache() === fingerprint) return;
-          await uploadGuildTrialStats({ request: dependencies.request, serverUrl, token, payload });
+          await uploadGuildTrialStats({ request: dependencies.request, fetch: dependencies.fetch, serverUrl, token, payload });
           await profileSettings.saveTrialStatsCache(fingerprint);
         } catch (error) {
           try { console.warn('mwi-guild-assistant: trial stats upload failed', error); } catch (_e) { /* best-effort */ }
@@ -4206,5 +4248,6 @@ if (typeof module === 'object' && module.exports) {
     getValue: GM_getValue,
     setValue: GM_setValue,
     request: GM_xmlhttpRequest,
+    fetch: typeof fetch === 'function' ? fetch.bind(globalThis) : null,
   });
 }
