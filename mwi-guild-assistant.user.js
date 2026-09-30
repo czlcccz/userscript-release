@@ -2,7 +2,7 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.22
+// @version      0.4.23
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
@@ -26,7 +26,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.22';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.23';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -1089,23 +1089,22 @@ const MWIGuildAssistantCore = (() => {
     const loadout = state?.loadoutMap?.[String(loadoutId)];
     if (!loadout) return null;
 
-    // loadoutId is provenance for troubleshooting only - no column stores it, and
-    // the ids are the player's own, so nothing else can resolve them. cycleStartAt
-    // is what keeps the bar from being reused next week: the bar is cycle-scoped
-    // data living on a profile that is not, so it declares the cycle it was read
-    // for and the server refuses to apply it to any other.
+    const equipment = Object.entries(loadout.wearableMap || {}).flatMap(([location, hash]) => {
+      const item = decodeItemHash(hash);
+      return item ? [{ itemHrid: item.itemHrid, slot: simplifyItemLocation(location), enhancementLevel: normalizeEnhancementLevel(item.enhancementLevel) }] : [];
+    }).sort((left, right) => left.itemHrid.localeCompare(right.itemHrid));
     return {
       cycleStartAt: String(state.guild.currentWeekStartAt),
       loadoutId,
+      ...(loadout.wearableMap ? { equipment } : {}),
       ...buildBarFromSlots(loadout.abilityMap, loadout.abilityCombatTriggersMap),
     };
   }
 
   // buildCombatTrialLoadoutFromShared reads the same bar out of a loadout_shared
   // message, which the game pushes when a guild admin opens a member's loadout in
-  // the guild-trial view. That view reports no loadout id, and a bar carrying no
-  // abilities is dropped rather than reported: the row would stay empty either
-  // way, and sending one could only blank a bar the member reported themselves.
+  // the guild-trial view. That view reports no loadout id. Equipment-only
+  // configurations are also kept; admin imports cannot overwrite filled rows.
   // cycleStartAt is the admin's own week - the cycle is global, so it is the
   // member's week too.
   function buildCombatTrialLoadoutFromShared(loadout, cycleStartAt) {
@@ -1119,7 +1118,7 @@ const MWIGuildAssistantCore = (() => {
       slotMap[slot] = abilityHrid;
     }
     const bar = buildBarFromSlots(slotMap, loadout?.abilityCombatTriggersMap);
-    if (!bar.specialAbilityHrid && bar.skillAbilityHrids.length === 0) return null;
+    if (!bar.specialAbilityHrid && bar.skillAbilityHrids.length === 0 && !loadout?.wearableItemMap) return null;
     return { cycleStartAt: cycle, ...bar };
   }
 
@@ -2425,6 +2424,7 @@ const MWIGuildAssistantCore = (() => {
     abilities.sort((left, right) => left.abilityHrid.localeCompare(right.abilityHrid));
 
     const combatTrialLoadout = buildCombatTrialLoadoutFromShared(loadout, state?.guild?.currentWeekStartAt);
+    if (combatTrialLoadout && loadout.wearableItemMap) combatTrialLoadout.equipment = equipment;
     return {
       schemaVersion: 1,
       kind: 'manual-player-profile',
