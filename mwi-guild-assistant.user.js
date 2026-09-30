@@ -2,7 +2,7 @@
 // @name         Milky Way Idle - 公会试炼助手
 // @namespace    https://www.milkywayidle.com/
 // @icon         https://mwi-guild-helper.cloud/favicon.png
-// @version      0.4.19
+// @version      0.4.22
 // @description  同步公会成员数据，可在后台一键完成生活试炼、战斗试炼的排刀，自动推演最佳阵容，提供试炼模拟器，可查看预估层数，成员贡献
 // @author       Clarion
 // @license      CC-BY-NC-SA-4.0
@@ -26,7 +26,7 @@ const MWIGuildAssistantCore = (() => {
   // SCRIPT_VERSION mirrors the userscript @version header. GM_info.script.version
   // is the source of truth under Tampermonkey; the literal fallback covers non-GM
   // runtimes (e.g. node tests) and must be kept in sync with @version on release.
-  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.19';
+  const SCRIPT_VERSION = (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || '0.4.22';
   const INVENTORY_LOCATION = '/item_locations/inventory';
   const WEB_SOCKET_HOOK_KEY = '__MWI_GUILD_ASSISTANT_WEB_SOCKET_HOOK__';
   const MESSAGE_EVENT_HOOK_KEY = '__MWI_GUILD_ASSISTANT_MESSAGE_EVENT_HOOK__';
@@ -49,6 +49,7 @@ const MWIGuildAssistantCore = (() => {
     'achievement_buffs_updated',
     'achievements_updated',
     'profile_shared',
+    'loadout_shared',
     'guild_trial_stats_updated',
   ]);
 
@@ -1012,6 +1013,116 @@ const MWIGuildAssistantCore = (() => {
     ));
   }
 
+  // The game's ability bar is five slots: slot 1 holds the special ability (光环),
+  // slots 2-5 the four ordinary ones. Confirmed against the ability catalog's
+  // isSpecialAbility flag on every combat loadout captured from the game.
+  // characterLoadoutMap keys slots as strings while a shared loadout carries a
+  // slotNumber field, so both paths normalise to this key space first.
+  const SPECIAL_ABILITY_SLOT = '1';
+  const SKILL_ABILITY_SLOTS = ['2', '3', '4', '5'];
+
+  // normalizeCombatTriggers keeps only the four fields the server's strict
+  // trigger schema accepts. The game owns this shape and may add fields; dropping
+  // an unknown one is better than failing the whole upload over it.
+  function normalizeCombatTriggers(rows) {
+    if (!Array.isArray(rows)) return [];
+    const out = [];
+    for (const row of rows) {
+      if (!row || typeof row !== 'object') continue;
+      const dependencyHrid = String(row.dependencyHrid || '');
+      const conditionHrid = String(row.conditionHrid || '');
+      const comparatorHrid = String(row.comparatorHrid || '');
+      const value = Number(row.value);
+      if (!dependencyHrid || !conditionHrid || !comparatorHrid || !Number.isFinite(value)) continue;
+      out.push({ dependencyHrid, conditionHrid, comparatorHrid, value });
+    }
+    return out;
+  }
+
+  // normalizeEnhancementLevel keeps an enhancement level only when it is a real
+  // non-negative integer; anything else means "unknown" (null), which the server
+  // stores as absent rather than as zero.
+  function normalizeEnhancementLevel(value) {
+    if (value === undefined || value === null) return null;
+    const level = Number(value);
+    return Number.isInteger(level) && level >= 0 ? level : null;
+  }
+
+  // buildBarFromSlots turns a slot -> abilityHrid map into the ability bar both
+  // upload paths send. Triggers carry overrides only: an ability left on its
+  // default triggers is omitted, which is what a stored bar means.
+  function buildBarFromSlots(slotMap, triggerMap) {
+    const specialAbilityHrid = String(slotMap?.[SPECIAL_ABILITY_SLOT] || '');
+    const skillAbilityHrids = SKILL_ABILITY_SLOTS
+      .map((slot) => String(slotMap?.[slot] || ''))
+      .filter(Boolean);
+    const triggers = {};
+    for (const abilityHrid of [specialAbilityHrid, ...skillAbilityHrids]) {
+      const rows = normalizeCombatTriggers(triggerMap?.[abilityHrid]);
+      if (rows.length) triggers[abilityHrid] = rows;
+    }
+    return {
+      ...(specialAbilityHrid ? { specialAbilityHrid } : {}),
+      skillAbilityHrids,
+      ...(Object.keys(triggers).length ? { triggers } : {}),
+    };
+  }
+
+  // buildCombatTrialLoadout reports the ability bar of the loadout this player
+  // picked when signing up for the current cycle's combat trial. The game only
+  // ever hands a character its own loadout definitions (characterLoadoutMap), so
+  // this is the one path by which a guildmate's actual trial skills can reach the
+  // platform: every player reports their own, and the admin's public-info upload
+  // supplies the roster those reports land on.
+  //
+  // Returns null when there is nothing to report: no combat signup for this
+  // cycle (same week-start check the roster upload uses), no loadout picked (the
+  // game's id 0), or a loadout the player has since deleted.
+  function buildCombatTrialLoadout(state) {
+    const characterId = String(state?.character?.id ?? '');
+    const member = characterId ? state?.guildCharacterMap?.[characterId] : null;
+    if (!member?.signedUpCombatTrialHrid) return null;
+    const weekStart = Date.parse(state?.guild?.currentWeekStartAt);
+    if (!Number.isFinite(weekStart) || Date.parse(member.signupWeekStartAt) !== weekStart) return null;
+    const loadoutId = Number(member.signedUpCombatLoadoutID);
+    if (!Number.isSafeInteger(loadoutId) || loadoutId <= 0) return null;
+    const loadout = state?.loadoutMap?.[String(loadoutId)];
+    if (!loadout) return null;
+
+    // loadoutId is provenance for troubleshooting only - no column stores it, and
+    // the ids are the player's own, so nothing else can resolve them. cycleStartAt
+    // is what keeps the bar from being reused next week: the bar is cycle-scoped
+    // data living on a profile that is not, so it declares the cycle it was read
+    // for and the server refuses to apply it to any other.
+    return {
+      cycleStartAt: String(state.guild.currentWeekStartAt),
+      loadoutId,
+      ...buildBarFromSlots(loadout.abilityMap, loadout.abilityCombatTriggersMap),
+    };
+  }
+
+  // buildCombatTrialLoadoutFromShared reads the same bar out of a loadout_shared
+  // message, which the game pushes when a guild admin opens a member's loadout in
+  // the guild-trial view. That view reports no loadout id, and a bar carrying no
+  // abilities is dropped rather than reported: the row would stay empty either
+  // way, and sending one could only blank a bar the member reported themselves.
+  // cycleStartAt is the admin's own week - the cycle is global, so it is the
+  // member's week too.
+  function buildCombatTrialLoadoutFromShared(loadout, cycleStartAt) {
+    const cycle = String(cycleStartAt || '');
+    if (!Number.isFinite(Date.parse(cycle))) return null;
+    const slotMap = {};
+    for (const ability of loadout?.equippedAbilities || []) {
+      const slot = String(ability?.slotNumber ?? '');
+      const abilityHrid = String(ability?.abilityHrid || '');
+      if (!slot || !abilityHrid) continue;
+      slotMap[slot] = abilityHrid;
+    }
+    const bar = buildBarFromSlots(slotMap, loadout?.abilityCombatTriggersMap);
+    if (!bar.specialAbilityHrid && bar.skillAbilityHrids.length === 0) return null;
+    return { cycleStartAt: cycle, ...bar };
+  }
+
   function buildSnapshot(state, now = new Date()) {
     if (!state?.hasCharacterData || !state.character) {
       throw new Error('等待角色数据，请刷新游戏页面');
@@ -1049,6 +1160,7 @@ const MWIGuildAssistantCore = (() => {
       buildAchievementBuffRows(state.achievementBuffs),
       buildSharedAchievementBuffRows([...state.characterAchievements.values()], state.details),
     );
+    const combatTrialLoadout = buildCombatTrialLoadout(state);
 
     return {
       schemaVersion: 1,
@@ -1062,6 +1174,7 @@ const MWIGuildAssistantCore = (() => {
       equipment,
       guildBuffs,
       achievementBuffs,
+      ...(combatTrialLoadout ? { combatTrialLoadout } : {}),
       diagnostics: {
         loadoutCount: Object.keys(state.loadoutMap || {}).length,
         loadoutEquipmentReferenceCount: collected.referenceCount,
@@ -1245,6 +1358,16 @@ const MWIGuildAssistantCore = (() => {
     return JSON.stringify(comparable);
   }
 
+  // buildPlayerImportFingerprint is the dedupe key for a 代录 payload. capturedAt
+  // is excluded on purpose: it is the moment the admin opened the member's panel,
+  // so keeping it would make every later visit to the same loadout look like new
+  // data and re-upload it.
+  function buildPlayerImportFingerprint(payload) {
+    if (!payload) return '';
+    const { capturedAt: _capturedAt, ...comparable } = payload;
+    return JSON.stringify(comparable);
+  }
+
   // buildBuildingLevelsFingerprint is a canonical, order-independent fingerprint
   // of a building-levels payload (sorted building hrids, capturedAt excluded) so
   // repeated unchanged captures do not re-upload.
@@ -1335,6 +1458,9 @@ const MWIGuildAssistantCore = (() => {
       equipment: snapshot?.equipment,
       guildBuffs: snapshot?.guildBuffs,
       achievementBuffs: snapshot?.achievementBuffs,
+      // Dropped from the wire payload when absent, so a player with no combat
+      // signup sends exactly what they sent before this field existed.
+      combatTrialLoadout: snapshot?.combatTrialLoadout,
     };
   }
 
@@ -1774,6 +1900,15 @@ const MWIGuildAssistantCore = (() => {
       async clearTrialStatsCache() {
         await setValue('trialStatsCache', '');
       },
+      async loadLoadoutSharedCache() {
+        return String(await getValue('loadoutSharedCache', '') || '');
+      },
+      async saveLoadoutSharedCache(fingerprint) {
+        await setValue('loadoutSharedCache', String(fingerprint || ''));
+      },
+      async clearLoadoutSharedCache() {
+        await setValue('loadoutSharedCache', '');
+      },
       async loadGuildBuildingsCache() {
         return String(await getValue('guildBuildingsCache', '') || '');
       },
@@ -1885,17 +2020,20 @@ const MWIGuildAssistantCore = (() => {
       savePublicInfoCache: settings.savePublicInfoCache,
       loadGuildBuildingsCache: settings.loadGuildBuildingsCache,
       saveGuildBuildingsCache: settings.saveGuildBuildingsCache,
+      loadLoadoutSharedCache: settings.loadLoadoutSharedCache,
+      saveLoadoutSharedCache: settings.saveLoadoutSharedCache,
       async getSyncCacheInfo() {
-        const [sync, publicInfo, guildBuildings] = await Promise.all([
+        const [sync, publicInfo, guildBuildings, loadoutShared] = await Promise.all([
           settings.loadSyncCache(),
           settings.loadPublicInfoCache(),
           settings.loadGuildBuildingsCache(),
+          settings.loadLoadoutSharedCache(),
         ]);
-        const size = (sync ? byteLength(sync) : 0) + (publicInfo ? byteLength(publicInfo) : 0) + (guildBuildings ? byteLength(guildBuildings) : 0);
+        const size = (sync ? byteLength(sync) : 0) + (publicInfo ? byteLength(publicInfo) : 0) + (guildBuildings ? byteLength(guildBuildings) : 0) + (loadoutShared ? byteLength(loadoutShared) : 0);
         return { size };
       },
       async clearSyncCache() {
-        await Promise.all([settings.clearSyncCache(), settings.clearPublicInfoCache(), settings.clearGuildBuildingsCache()]);
+        await Promise.all([settings.clearSyncCache(), settings.clearPublicInfoCache(), settings.clearGuildBuildingsCache(), settings.clearLoadoutSharedCache()]);
       },
     };
     // A detached panel must never combine its token with the next role's state.
@@ -2078,6 +2216,16 @@ const MWIGuildAssistantCore = (() => {
         }
         return false;
       }
+      if (message.type === 'loadout_shared') {
+        // A guildmate's loadout, pushed when it is opened in the guild-trial view.
+        // Like profile_shared it is not the local character's state, so it never
+        // enters reduceMessage; the bootstrap wiring may push it to the server via
+        // onLoadoutShared. Returns false so the panel does not re-render.
+        if (typeof handlers.onLoadoutShared === 'function') {
+          try { handlers.onLoadoutShared(message); } catch (_error) { /* best-effort */ }
+        }
+        return false;
+      }
       if (message.type === 'guild_trial_stats_updated') {
         // The game's per-member trial stats (workDone for skilling, damage for
         // combat) for the current cycle. Not the local character's state, so it
@@ -2179,13 +2327,7 @@ const MWIGuildAssistantCore = (() => {
       const itemHrid = String(row?.itemHrid || '').trim();
       if (!itemHrid) continue;
       const slot = row?.itemLocationHrid ? String(row.itemLocationHrid) : null;
-      let enhancementLevel = null;
-      const enh = row?.enhancementLevel;
-      if (enh !== undefined && enh !== null) {
-        const value = Number(enh);
-        enhancementLevel = Number.isInteger(value) && value >= 0 ? value : null;
-      }
-      equipment.push({ itemHrid, slot, enhancementLevel });
+      equipment.push({ itemHrid, slot, enhancementLevel: normalizeEnhancementLevel(row?.enhancementLevel) });
     }
     equipment.sort((left, right) => left.itemHrid.localeCompare(right.itemHrid));
 
@@ -2225,6 +2367,88 @@ const MWIGuildAssistantCore = (() => {
     const characterId = resolveSharedCharacterId(profile);
     if (!characterId) return null;
     return { characterId };
+  }
+
+  // selectLoadoutSharedTarget returns the guildmate's characterId when a
+  // loadout_shared message is one the assistant may record: the member has a
+  // loadout set, it is a combat loadout, and the character is a joined member of
+  // our own guild. The message names no guild and no character id of its own - the
+  // id only appears on its item and ability rows - so membership is decided
+  // against the roster the assistant already holds, never against anything the
+  // message claims. Pure function for testability.
+  function selectLoadoutSharedTarget(state, message) {
+    const loadout = message?.loadout;
+    if (!loadout || loadout.hasLoadout !== true) return null;
+    if (loadout.actionTypeHrid !== '/action_types/combat') return null;
+    const characterId = resolveSharedCharacterId(loadout);
+    if (!characterId) return null;
+    const member = state?.guildCharacterMap?.[characterId];
+    if (!member || member.status !== 'joined') return null;
+    return { characterId };
+  }
+
+  // buildManualPlayerImportFromLoadoutShared converts a loadout_shared message
+  // into the same ManualPlayerImportV1 the profile_shared path sends, so a guild
+  // admin opening a member's trial loadout in game records that member's
+  // equipment and abilities on their behalf. Groups the message cannot supply
+  // (skill levels, house rooms, guild buffs, achievements) are sent empty, which
+  // the server merges as "leave the stored rows alone". Returns null when there is
+  // nothing to record.
+  function buildManualPlayerImportFromLoadoutShared(state, message, now = new Date()) {
+    const loadout = message?.loadout;
+    const target = selectLoadoutSharedTarget(state, message);
+    if (!target) return null;
+    const character = loadout.sharableCharacter || {};
+    const name = String(character.name || '').trim();
+    if (!name) return null;
+
+    const equipment = [];
+    for (const [locationHrid, row] of Object.entries(loadout.wearableItemMap || {})) {
+      const itemHrid = String(row?.itemHrid || '').trim();
+      if (!itemHrid) continue;
+      equipment.push({
+        itemHrid,
+        slot: simplifyItemLocation(row?.itemLocationHrid || locationHrid),
+        enhancementLevel: normalizeEnhancementLevel(row?.enhancementLevel),
+      });
+    }
+    equipment.sort((left, right) => left.itemHrid.localeCompare(right.itemHrid));
+
+    const abilities = [];
+    for (const row of loadout.equippedAbilities || []) {
+      const abilityHrid = String(row?.abilityHrid || '').trim();
+      if (!abilityHrid) continue;
+      const level = Number(row?.level);
+      if (!Number.isInteger(level) || level < 0) continue;
+      abilities.push({ abilityHrid, level });
+    }
+    abilities.sort((left, right) => left.abilityHrid.localeCompare(right.abilityHrid));
+
+    const combatTrialLoadout = buildCombatTrialLoadoutFromShared(loadout, state?.guild?.currentWeekStartAt);
+    return {
+      schemaVersion: 1,
+      kind: 'manual-player-profile',
+      capturedAt: (now || new Date()).toISOString(),
+      character: {
+        id: target.characterId,
+        name,
+        gameMode: String(character.gameMode || ''),
+        // The shared loadout carries no total level; the server keeps the stored
+        // one when this is 0 instead of zeroing a synced member.
+        totalLevel: 0,
+      },
+      // The message carries no guild, so the payload names our own - the server
+      // refuses it unless that matches the guild the token is bound to.
+      guild: {
+        id: String(state?.guild?.id ?? ''),
+        name: String(state?.guild?.name || ''),
+      },
+      skillLevels: [],
+      houseRooms: [],
+      equipment,
+      abilities,
+      ...(combatTrialLoadout ? { combatTrialLoadout } : {}),
+    };
   }
 
   // shouldThrottleProfileImport is the 5s dedupe gate for profile uploads.
@@ -4049,6 +4273,10 @@ const MWIGuildAssistantCore = (() => {
     // repeatedly opening the same shareable profile within 5s only uploads
     // once. In-memory only; resets on page reload, which is acceptable.
     const profileDedupe = new Map();
+    // loadoutDedupe is the same 5s gate for loadout_shared. It is a separate map
+    // from profileDedupe because the two messages are different user actions: an
+    // admin can open a member's profile and their loadout back to back.
+    const loadoutDedupe = new Map();
     const getProfileSettings = () => dependencies ? createSettingsStore(dependencies.getValue, dependencies.setValue, state.character?.id) : null;
     const onProfileShared = (message) => {
       const profileSettings = getProfileSettings();
@@ -4088,6 +4316,51 @@ const MWIGuildAssistantCore = (() => {
         }
       })();
     };
+    // Records a guildmate's trial loadout when an admin opens it in game. The
+    // game pushes loadout_shared for a member's loadout, carrying the equipment
+    // and the ability bar the member signed up with - the only way the platform
+    // learns either for a member who does not run the userscript. The import goes
+    // to the same endpoint the profile_shared path uses, with the same management
+    // token gate and 5s per-character throttle, so only guild admins record
+    // anything. A GM-backed fingerprint cache skips re-opening the same loadout;
+    // the cache is only written after the server accepts, so a rejected upload
+    // retries on the next message.
+    const onLoadoutShared = (message) => {
+      const settings = getProfileSettings();
+      const loadout = message?.loadout;
+      const loadoutLog = (info) => {
+        try { console.log('mwi-guild-assistant: loadout', { name: loadout?.sharableCharacter?.name, ...info }); } catch (_e) { /* best-effort */ }
+      };
+      if (!settings || typeof dependencies?.request !== 'function') { loadoutLog({ action: 'skip', reason: '助手未就绪' }); return; }
+      if (!isPublicSyncPlayer) { loadoutLog({ action: 'skip', reason: '非管理 token 或连接未确认' }); return; }
+      const target = selectLoadoutSharedTarget(state, message);
+      if (!target) { loadoutLog({ action: 'skip', reason: '非本公会成员、非战斗配装或未设置配装' }); return; }
+      const now = dependencies.now?.() || new Date();
+      const nowMs = now.getTime();
+      if (shouldThrottleProfileImport(target.characterId, nowMs, loadoutDedupe)) { loadoutLog({ action: 'skip', reason: '5 秒内已上报，去重' }); return; }
+      const payload = buildManualPlayerImportFromLoadoutShared(state, message, now);
+      if (!payload) { loadoutLog({ action: 'skip', reason: '配装解析失败' }); return; }
+      loadoutDedupe.set(target.characterId, nowMs);
+      // Fire-and-forget: an import must never block websocket handling.
+      void (async () => {
+        try {
+          const fingerprint = buildPlayerImportFingerprint(payload);
+          let cached = '';
+          try { cached = await settings.loadLoadoutSharedCache(); } catch (_error) { /* best-effort */ }
+          if (cached === fingerprint) { loadoutLog({ action: 'skip', reason: '配装未变化，去重' }); return; }
+          const config = await settings.load();
+          const serverUrl = String(config?.serverUrl || '').trim();
+          const token = String(config?.token || '').trim();
+          if (!serverUrl || !token) { loadoutLog({ action: 'skip', reason: '未配置服务器或 token' }); return; }
+          loadoutLog({ action: 'upload', method: 'POST', url: '/api/v1/uploads/player-import', server: serverUrl, characterId: target.characterId });
+          await uploadPlayerImport({ request: dependencies.request, fetch: dependencies.fetch, serverUrl, token, payload });
+          try { await settings.saveLoadoutSharedCache(fingerprint); } catch (_error) { /* best-effort */ }
+          loadoutLog({ action: 'uploaded', characterId: target.characterId });
+        } catch (error) {
+          try { console.warn('mwi-guild-assistant: loadout import failed', error); } catch (_e) { /* best-effort */ }
+        }
+      })();
+    };
     // Uploads the game's per-member trial stats (guild_trial_stats_updated) to
     // the server. The stats are a full guild-wide dataset, so like the public-info
     // roster upload this is gated on a management token (isPublicSyncPlayer) - a
@@ -4119,7 +4392,7 @@ const MWIGuildAssistantCore = (() => {
       })();
     };
     const handleRawMessage = async (rawData) => {
-      if (await processSocketData(state, rawData, { onProfileShared, onGuildTrialStatsUpdated })) {
+      if (await processSocketData(state, rawData, { onProfileShared, onLoadoutShared, onGuildTrialStatsUpdated })) {
         if (uiCharacterId !== String(state.character?.id || '') || uiGuildId !== String(state.guild?.id || '')) {
           ui?.disconnect();
           ui = null;
@@ -4175,6 +4448,7 @@ const MWIGuildAssistantCore = (() => {
     reduceMessage,
     buildGuildRoster,
     buildSnapshot,
+    buildCombatTrialLoadout,
     buildGuildTrialSnapshot,
     buildGuildTrialUploadPayload,
     buildGuildPublicInfoUploadPayload,
@@ -4183,6 +4457,10 @@ const MWIGuildAssistantCore = (() => {
     buildTrialStatsFingerprint,
     buildBuildingLevelsFingerprint,
     buildManualPlayerImportFromShared,
+    buildManualPlayerImportFromLoadoutShared,
+    buildCombatTrialLoadoutFromShared,
+    buildPlayerImportFingerprint,
+    selectLoadoutSharedTarget,
     selectProfileSharedTarget,
     shouldThrottleProfileImport,
     buildUploadPayload,
